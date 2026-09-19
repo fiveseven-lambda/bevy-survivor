@@ -1,18 +1,20 @@
 use bevy::image::{ImageAddressMode, ImageSampler, ImageSamplerDescriptor};
 use bevy::prelude::*;
 use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
+use parry2d::bounding_volume::Aabb;
+use parry2d::partitioning::{Bvh, BvhWorkspace};
 use rand::RngExt;
 
 const VIEWPORT_RATIO: UVec2 = uvec2(16, 9);
 const VIEW_SIZE: Vec2 = vec2(64.0, 36.0);
-const FIELD_SIZE: UVec2 = uvec2(1024, 576);
+const FIELD_SIZE: UVec2 = uvec2(16 * 16, 16 * 9);
 const FIELD_WIDTH: usize = FIELD_SIZE.x as usize;
 const FIELD_HEIGHT: usize = FIELD_SIZE.y as usize;
 
 const RESOURCE_COLORS: [Color; 3] = [
-    Color::hsl(40.0, 0.8, 0.5),
-    Color::hsl(160.0, 0.8, 0.5),
-    Color::hsl(280.0, 0.8, 0.5),
+    Color::hsl(0.0, 0.8, 0.5),
+    Color::hsl(120.0, 0.8, 0.5),
+    Color::hsl(240.0, 0.8, 0.5),
 ];
 
 #[derive(Resource)]
@@ -25,11 +27,33 @@ struct Player {
     resources: [f32; 3],
 }
 
+#[derive(Resource)]
+struct ResourceColors([Handle<ColorMaterial>; 3]);
+
 #[derive(Component)]
 struct PlayerStroke;
 
 #[derive(Component)]
 struct PlayerFill;
+
+#[derive(Component)]
+struct Approaching {
+    speed: f32,
+}
+
+#[derive(Resource)]
+struct EnemySource {
+    stroke: Handle<Mesh>,
+    stroke_color: Handle<ColorMaterial>,
+    tick: std::time::Duration,
+}
+
+#[derive(Resource)]
+struct Enemies {
+    bvh: Bvh,
+    workspace: BvhWorkspace,
+    count: usize,
+}
 
 fn main() {
     App::new()
@@ -46,6 +70,8 @@ fn main() {
         )
         .add_systems(Update, update_direction.run_if(on_message::<CursorMoved>))
         .add_systems(Update, move_player)
+        .add_systems(Update, move_enemies_approaching)
+        .add_systems(Update, create_enemies_approaching)
         .run();
 }
 
@@ -75,7 +101,7 @@ fn setup(
     let mut field_values: Vec<Vec<[f64; 3]>> = (0..FIELD_HEIGHT)
         .map(|_| (0..FIELD_WIDTH).map(|_| rng.random()).collect())
         .collect();
-    for _ in 0..1000 {
+    for _ in 0..100 {
         field_values = (0..FIELD_HEIGHT)
             .map(|i| {
                 let up = if i == 0 { FIELD_HEIGHT - 1 } else { i - 1 };
@@ -154,20 +180,27 @@ fn setup(
     commands.spawn((field_sprite, Transform::from_xyz(0.0, 0.0, -1.0)));
 
     let player_fill = Circle::new(1.0);
-    let player_fill_color = RESOURCE_COLORS[field[0][0] as usize];
+    let resource_colors = RESOURCE_COLORS.map(|color| materials.add(color));
+    let player_fill_color = resource_colors[field[0][0] as usize].clone();
     commands.spawn((
         PlayerFill,
         Mesh2d(meshes.add(player_fill)),
-        MeshMaterial2d(materials.add(player_fill_color)),
+        MeshMaterial2d(player_fill_color),
     ));
+    commands.insert_resource(ResourceColors(resource_colors));
 
     let player_stroke = Circle::new(1.0).to_ring(0.1);
     let player_stroke_color = Color::WHITE;
-    commands.spawn((
-        PlayerStroke,
-        Mesh2d(meshes.add(player_stroke)),
-        MeshMaterial2d(materials.add(player_stroke_color)),
-    ));
+    let index = commands
+        .spawn((
+            PlayerStroke,
+            Mesh2d(meshes.add(player_stroke)),
+            MeshMaterial2d(materials.add(player_stroke_color)),
+        ))
+        .id()
+        .index_u32();
+    let mut bvh = Bvh::new();
+    bvh.insert(Aabb::new(-Vec2::splat(5.0), Vec2::splat(5.0)), index);
 
     commands.insert_resource(Field(field));
 
@@ -184,6 +217,20 @@ fn setup(
             scale: Vec3::splat(0.1),
         },
     ));
+
+    let enemy_stroke = Circle::new(0.5).to_ring(0.1);
+    let enemy_stroke_color = Color::BLACK;
+    commands.insert_resource(EnemySource {
+        stroke: meshes.add(enemy_stroke),
+        stroke_color: materials.add(enemy_stroke_color),
+        tick: std::time::Duration::ZERO,
+    });
+
+    commands.insert_resource(Enemies {
+        bvh,
+        workspace: BvhWorkspace::default(),
+        count: 0,
+    });
 }
 
 fn update_viewport(mut camera: Single<&mut Camera>, window: Single<&Window>) {
@@ -217,10 +264,9 @@ fn update_direction(
 
 fn move_player(
     mut player: ResMut<Player>,
-    mut materials: ResMut<Assets<ColorMaterial>>,
     mut background: Single<&mut Sprite>,
-    mut text: Single<&mut Text2d>,
-    player_fill: Single<&MeshMaterial2d<ColorMaterial>, With<PlayerFill>>,
+    mut player_fill: Single<&mut MeshMaterial2d<ColorMaterial>, With<PlayerFill>>,
+    resource_colors: Res<ResourceColors>,
     field: Res<Field>,
     time: Res<Time>,
 ) {
@@ -232,12 +278,7 @@ fn move_player(
     let IVec2 { x: column, y: row } = pos_int - q;
     let cell = field.0[row as usize][column as usize] as usize;
     player.resources[cell] += time.delta_secs();
-    text.0 = format!(
-        "{:.1}, {:.1}, {:.1}",
-        player.resources[0], player.resources[1], player.resources[2],
-    );
-    let color = RESOURCE_COLORS[cell];
-    materials.get_mut(player_fill.id()).unwrap().color = color;
+    player_fill.0 = resource_colors.0[cell].clone();
     background.rect = Some(Rect::from_center_size(
         Vec2 {
             x: player.position.x,
@@ -245,4 +286,78 @@ fn move_player(
         },
         VIEW_SIZE,
     ));
+}
+
+fn create_enemies_approaching(
+    mut commands: Commands,
+    mut enemy_source: ResMut<EnemySource>,
+    mut enemies: ResMut<Enemies>,
+    time: Res<Time>,
+) {
+    let mut rng = rand::rng();
+    enemy_source.tick += time.delta();
+    let t = std::time::Duration::from_millis(10);
+    while enemy_source.tick > t {
+        enemy_source.tick -= t;
+        let pos = 40.0 * Vec2::from_angle(rng.random_range(0.0..360.0));
+        let index = commands
+            .spawn((
+                Mesh2d(enemy_source.stroke.clone()),
+                MeshMaterial2d(enemy_source.stroke_color.clone()),
+                Approaching { speed: 10.0 },
+                Transform::from_translation(pos.extend(0.0)),
+            ))
+            .id()
+            .index_u32();
+        enemies.bvh.insert(
+            Aabb::new(pos - Vec2::splat(5.0), pos + Vec2::splat(5.0)),
+            index,
+        );
+    }
+}
+
+fn move_enemies_approaching(
+    mut commands: Commands,
+    query: Query<(Entity, &mut Transform, &Approaching)>,
+    enemies: ResMut<Enemies>,
+    time: Res<Time>,
+    player: ResMut<Player>,
+    mut text: Single<&mut Text2d>,
+) {
+    let enemies = enemies.into_inner();
+    enemies.bvh.refit(&mut enemies.workspace);
+    enemies.count += 1;
+    if enemies.count > 10 {
+        enemies.bvh.optimize_incremental(&mut enemies.workspace);
+        enemies.count = 0;
+    }
+    let mut count = 0;
+    for (entity, mut enemy_transform, enemy) in query {
+        let old_pos = enemy_transform.translation.truncate();
+        let delta = -enemy.speed * time.delta_secs() * old_pos.normalize();
+        let mut collision = Vec2::ZERO;
+        let aabb = Aabb::new(old_pos - Vec2::splat(5.0), old_pos + Vec2::splat(5.0));
+        for index in enemies.bvh.intersect_aabb(&aabb) {
+            if index == entity.index_u32() {
+                continue;
+            }
+            let diff = old_pos - enemies.bvh.leaf_node(index).unwrap().center();
+            let distance = diff.length();
+            if distance < 10.0 {
+                collision += 0.1 * diff / distance.powf(2.0) * delta.length();
+            }
+        }
+        let new_pos =
+            old_pos - 10. * player.direction.normalize() * time.delta_secs() + delta + collision;
+        if new_pos.length() > 40.0 || new_pos.length() < 1.0 {
+            enemies.bvh.remove(entity.index_u32());
+            commands.entity(entity).despawn();
+        } else {
+            count += 1;
+            let aabb = Aabb::new(new_pos - Vec2::splat(5.0), new_pos + Vec2::splat(5.0));
+            enemies.bvh.insert(aabb, entity.index_u32());
+            enemy_transform.translation = new_pos.extend(0.0);
+        }
+    }
+    text.0 = count.to_string();
 }

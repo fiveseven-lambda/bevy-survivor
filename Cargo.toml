@@ -5,4 +5,5 @@ edition = "2024"
 
 [dependencies]
 bevy = "0.19.1"
+parry2d = "0.27.0"
 rand = "0.10.2"
