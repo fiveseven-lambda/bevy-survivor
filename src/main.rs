@@ -35,6 +35,9 @@ enum LoadingMessage {
 }
 
 #[derive(Component)]
+struct Paused;
+
+#[derive(Component)]
 struct ProgressBar;
 
 #[derive(Resource)]
@@ -68,13 +71,7 @@ fn main() {
             update_loading_screen.run_if(in_state(State::Loading)),
         )
         .add_systems(OnEnter(State::Paused), setup_title_screen)
-        .add_systems(
-            Update,
-            resume.run_if(
-                in_state(State::Paused)
-                    .and_then(on_message::<bevy::input::keyboard::KeyboardInput>),
-            ),
-        )
+        .add_systems(Update, resume.run_if(in_state(State::Paused)))
         .add_systems(
             Update,
             update_direction.run_if(in_state(State::Running).and_then(on_message::<CursorMoved>)),
@@ -273,7 +270,6 @@ fn setup_title_screen(
     let mut field_sprite = Sprite::from_image(images.add(field_image));
     field_sprite.rect = Some(Rect::from_center_size(Vec2::ZERO, VIEW_SIZE));
     commands.spawn((field_sprite, Transform::from_xyz(0.0, 0.0, -1.0)));
-    commands.insert_resource(PlayerDirection(Vec2::X));
     let player_fill = Circle::new(1.0);
     let colors = RESOURCE_COLORS.map(|color| materials.add(color));
     let player_fill_color = colors[field.0[0][0] as usize].clone();
@@ -294,10 +290,47 @@ fn setup_title_screen(
         Mesh2d(meshes.add(player_stroke)),
         MeshMaterial2d(materials.add(player_stroke_color)),
     ));
+
+    commands.spawn((
+        Paused,
+        Mesh2d(meshes.add(Rectangle::from_size(VIEW_SIZE))),
+        MeshMaterial2d(materials.add(Color::hsva(0.0, 0.0, 0.0, 0.9))),
+    ));
+    commands.spawn((
+        Paused,
+        Text2d(String::from("Press Space")),
+        TextFont {
+            font_size: FontSize::from(80.0),
+            ..default()
+        },
+        Transform::from_scale(Vec3 {
+            x: 0.1,
+            y: 0.1,
+            z: 1.0,
+        }),
+    ));
 }
 
-fn resume(mut next_state: ResMut<NextState<State>>) {
-    next_state.set(State::Running);
+fn resume(
+    mut commands: Commands,
+    mut next_state: ResMut<NextState<State>>,
+    paused: Query<Entity, With<Paused>>,
+    mut keyboard_inputs: MessageReader<bevy::input::keyboard::KeyboardInput>,
+    window: Single<&Window>,
+    camera: Single<(&Camera, &GlobalTransform)>,
+) {
+    for keyboard_input in keyboard_inputs.read() {
+        if keyboard_input.key_code == KeyCode::Space
+            && keyboard_input.state == bevy::input::ButtonState::Released
+        {
+            for entity in paused {
+                commands.entity(entity).despawn();
+            }
+            commands.insert_resource(PlayerDirection(calculate_direction(*window, *camera)));
+            next_state.set(State::Running);
+            return;
+        }
+    }
 }
 
 fn update_direction(
@@ -305,11 +338,19 @@ fn update_direction(
     window: Single<&Window>,
     camera: Single<(&Camera, &GlobalTransform)>,
 ) {
-    let (camera, camera_transform) = camera.into_inner();
+    player_direction.0 = calculate_direction(*window, *camera);
+}
+
+fn calculate_direction(
+    window: &Window,
+    (camera, camera_transform): (&Camera, &GlobalTransform),
+) -> Vec2 {
     if let Some(viewport_position) = window.cursor_position()
         && let Ok(world_position) = camera.viewport_to_world_2d(camera_transform, viewport_position)
     {
-        player_direction.0 = world_position;
+        world_position
+    } else {
+        Vec2::X
     }
 }
 
@@ -321,7 +362,8 @@ fn update(
     field: Res<Field>,
     time: Res<Time>,
 ) {
-    let pos_float = player.position + 10. * player_direction.0.normalize() * time.delta_secs();
+    let pos_float =
+        player.position + 10. * player_direction.0.normalize_or(Vec2::X) * time.delta_secs();
     let pos_int = pos_float.as_ivec2();
     let field_size = FIELD_SIZE.as_ivec2();
     let q = pos_int.div_euclid(field_size) * field_size;
