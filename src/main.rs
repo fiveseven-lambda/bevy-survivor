@@ -31,7 +31,10 @@ struct LoadingState(Arc<Mutex<Option<LoadingMessage>>>);
 
 enum LoadingMessage {
     Loading(f32),
-    Ready(Vec<Vec<u8>>),
+    Ready {
+        field: Vec<Vec<u8>>,
+        rng: Box<rand::rngs::StdRng>,
+    },
 }
 
 #[derive(Component)]
@@ -49,7 +52,7 @@ struct PlayerDirection(Vec2);
 #[derive(Resource)]
 struct Player {
     position: Vec2,
-    colors: [Handle<ColorMaterial>; 3],
+    resources: [f32; 3],
 }
 
 #[derive(Component)]
@@ -57,6 +60,23 @@ struct PlayerStroke;
 
 #[derive(Component)]
 struct PlayerFill;
+
+#[derive(Resource)]
+struct ResourceColors([Handle<ColorMaterial>; 3]);
+
+#[derive(Resource)]
+struct RandomSource(rand::rngs::StdRng);
+
+#[derive(Component)]
+struct EnemySource {
+    stroke: Handle<Mesh>,
+    stroke_color: Handle<ColorMaterial>,
+    pace: std::time::Duration,
+    time: std::time::Duration,
+}
+
+#[derive(Component)]
+struct Enemy;
 
 fn main() {
     App::new()
@@ -70,13 +90,14 @@ fn main() {
             Update,
             update_loading_screen.run_if(in_state(State::Loading)),
         )
-        .add_systems(OnEnter(State::Paused), setup_title_screen)
+        .add_systems(OnExit(State::Loading), setup_title_screen)
         .add_systems(Update, resume.run_if(in_state(State::Paused)))
         .add_systems(
             Update,
             update_direction.run_if(in_state(State::Running).and_then(on_message::<CursorMoved>)),
         )
         .add_systems(Update, update.run_if(in_state(State::Running)))
+        .add_systems(Update, spawn_enemies.run_if(in_state(State::Running)))
         .insert_state(State::Loading)
         .run();
 }
@@ -105,7 +126,7 @@ fn setup(
     let loading_state = Arc::new(Mutex::new(Some(LoadingMessage::Loading(0.0))));
     commands.insert_resource(LoadingState(loading_state.clone()));
     std::thread::spawn(move || {
-        let mut rng = rand::rng();
+        let mut rng: rand::rngs::StdRng = rand::make_rng();
         let mut field_values: Vec<Vec<[f64; 3]>> = (0..FIELD_HEIGHT)
             .map(|_| (0..FIELD_WIDTH).map(|_| rng.random()).collect())
             .collect();
@@ -162,7 +183,10 @@ fn setup(
                     .collect()
             })
             .collect();
-        *loading_state.lock().unwrap() = Some(LoadingMessage::Ready(field));
+        *loading_state.lock().unwrap() = Some(LoadingMessage::Ready {
+            field,
+            rng: Box::new(rng),
+        });
     });
 
     let progress_bar = Rectangle::from_size(Vec2::new(56.0, 4.0));
@@ -227,9 +251,10 @@ fn update_loading_screen(
             progress_bar.translation.x = 28.0 * (progress - 1.0);
             progress_bar.scale.x = progress;
         }
-        LoadingMessage::Ready(field) => {
+        LoadingMessage::Ready { field, rng } => {
             commands.set_state(State::Paused);
             commands.insert_resource(Field(field));
+            commands.insert_resource(RandomSource(*rng));
         }
     }
 }
@@ -280,8 +305,9 @@ fn setup_title_screen(
     ));
     commands.insert_resource(Player {
         position: Vec2::ZERO,
-        colors,
+        resources: [0.0; 3],
     });
+    commands.insert_resource(ResourceColors(colors));
 
     let player_stroke = Circle::new(1.0).to_ring(0.1);
     let player_stroke_color = Color::WHITE;
@@ -309,6 +335,19 @@ fn setup_title_screen(
             z: 1.0,
         }),
     ));
+    commands.spawn(EnemySource {
+        stroke: meshes.add(Circle::new(0.5).to_ring(0.1)),
+        stroke_color: materials.add(Color::BLACK),
+        pace: std::time::Duration::from_secs(1),
+        time: std::time::Duration::ZERO,
+    });
+
+    commands.spawn(EnemySource {
+        stroke: meshes.add(Circle::new(0.2).to_ring(0.1)),
+        stroke_color: materials.add(Color::BLACK),
+        pace: std::time::Duration::from_millis(200),
+        time: std::time::Duration::ZERO,
+    });
 }
 
 fn resume(
@@ -358,19 +397,27 @@ fn update(
     mut player: ResMut<Player>,
     mut player_fill: Single<&mut MeshMaterial2d<ColorMaterial>, With<PlayerFill>>,
     mut background: Single<&mut Sprite>,
+    enemies: Query<&mut Transform, With<Enemy>>,
     player_direction: Res<PlayerDirection>,
+    resource_colors: Res<ResourceColors>,
     field: Res<Field>,
     time: Res<Time>,
 ) {
-    let pos_float =
-        player.position + 10. * player_direction.0.normalize_or(Vec2::X) * time.delta_secs();
+    let delta_pos = 10. * player_direction.0.normalize_or(Vec2::X) * time.delta_secs();
+    for mut enemy in enemies {
+        let old_pos = enemy.translation.truncate();
+        let new_pos = old_pos - 10. * old_pos.normalize() * time.delta_secs() - delta_pos;
+        enemy.translation = new_pos.extend(0.0);
+    }
+    let pos_float = player.position + delta_pos;
     let pos_int = pos_float.as_ivec2();
     let field_size = FIELD_SIZE.as_ivec2();
     let q = pos_int.div_euclid(field_size) * field_size;
     player.position = pos_float - q.as_vec2();
     let IVec2 { x: column, y: row } = pos_int - q;
     let cell = field.0[row as usize][column as usize] as usize;
-    player_fill.0 = player.colors[cell].clone();
+    player.resources[cell] += time.delta_secs();
+    player_fill.0 = resource_colors.0[cell].clone();
     background.rect = Some(Rect::from_center_size(
         Vec2 {
             x: player.position.x,
@@ -378,4 +425,26 @@ fn update(
         },
         VIEW_SIZE,
     ));
+}
+
+fn spawn_enemies(
+    mut commands: Commands,
+    mut random_source: ResMut<RandomSource>,
+    enemy_sources: Query<&mut EnemySource>,
+    time: Res<Time>,
+) {
+    for mut enemy_source in enemy_sources {
+        let time = enemy_source.time + time.delta();
+        let num_enemies = (time.as_nanos() / enemy_source.pace.as_nanos()) as u32;
+        enemy_source.time = time - num_enemies * enemy_source.pace;
+        let pos = 40.0 * Vec2::from_angle(random_source.0.random_range(0.0..360.0));
+        for _ in 0..num_enemies {
+            commands.spawn((
+                Enemy,
+                Mesh2d(enemy_source.stroke.clone()),
+                MeshMaterial2d(enemy_source.stroke_color.clone()),
+                Transform::from_translation(pos.extend(0.0)),
+            ));
+        }
+    }
 }
