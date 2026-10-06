@@ -1,6 +1,8 @@
 use bevy::image::{ImageAddressMode, ImageSampler, ImageSamplerDescriptor};
 use bevy::prelude::*;
 use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
+use parry2d::bounding_volume::Aabb;
+use parry2d::partitioning::{Bvh, BvhWorkspace};
 use rand::RngExt;
 use std::sync::{Arc, Mutex};
 
@@ -69,6 +71,7 @@ struct RandomSource(rand::rngs::StdRng);
 
 #[derive(Component)]
 struct EnemySource {
+    radius: f32,
     stroke: Handle<Mesh>,
     stroke_color: Handle<ColorMaterial>,
     pace: std::time::Duration,
@@ -76,7 +79,16 @@ struct EnemySource {
 }
 
 #[derive(Component)]
-struct Enemy;
+struct Enemy {
+    radius: f32,
+}
+
+#[derive(Resource)]
+struct EnemiesBvh {
+    bvh: Bvh,
+    workspace: BvhWorkspace,
+    optimization_counter: u32,
+}
 
 fn main() {
     App::new()
@@ -97,7 +109,6 @@ fn main() {
             update_direction.run_if(in_state(State::Running).and_then(on_message::<CursorMoved>)),
         )
         .add_systems(Update, update.run_if(in_state(State::Running)))
-        .add_systems(Update, spawn_enemies.run_if(in_state(State::Running)))
         .insert_state(State::Loading)
         .run();
 }
@@ -336,17 +347,25 @@ fn setup_title_screen(
         }),
     ));
     commands.spawn(EnemySource {
-        stroke: meshes.add(Circle::new(0.5).to_ring(0.1)),
+        radius: 0.6,
+        stroke: meshes.add(Circle::new(0.6).to_ring(0.1)),
         stroke_color: materials.add(Color::BLACK),
         pace: std::time::Duration::from_secs(1),
         time: std::time::Duration::ZERO,
     });
 
     commands.spawn(EnemySource {
-        stroke: meshes.add(Circle::new(0.2).to_ring(0.1)),
+        radius: 0.4,
+        stroke: meshes.add(Circle::new(0.4).to_ring(0.1)),
         stroke_color: materials.add(Color::BLACK),
         pace: std::time::Duration::from_millis(200),
         time: std::time::Duration::ZERO,
+    });
+
+    commands.insert_resource(EnemiesBvh {
+        bvh: Bvh::new(),
+        workspace: BvhWorkspace::default(),
+        optimization_counter: 0,
     });
 }
 
@@ -394,22 +413,21 @@ fn calculate_direction(
 }
 
 fn update(
+    mut commands: Commands,
     mut player: ResMut<Player>,
     mut player_fill: Single<&mut MeshMaterial2d<ColorMaterial>, With<PlayerFill>>,
     mut background: Single<&mut Sprite>,
-    enemies: Query<&mut Transform, With<Enemy>>,
+    mut enemies: Query<(Entity, &Enemy, &mut Transform)>,
+    enemies_bvh: ResMut<EnemiesBvh>,
+    enemy_sources: Query<&mut EnemySource>,
+    mut random_source: ResMut<RandomSource>,
     player_direction: Res<PlayerDirection>,
     resource_colors: Res<ResourceColors>,
     field: Res<Field>,
     time: Res<Time>,
 ) {
-    let delta_pos = 10. * player_direction.0.normalize_or(Vec2::X) * time.delta_secs();
-    for mut enemy in enemies {
-        let old_pos = enemy.translation.truncate();
-        let new_pos = old_pos - 10. * old_pos.normalize() * time.delta_secs() - delta_pos;
-        enemy.translation = new_pos.extend(0.0);
-    }
-    let pos_float = player.position + delta_pos;
+    let player_velocity = 10. * player_direction.0.normalize_or(Vec2::X);
+    let pos_float = player.position + player_velocity * time.delta_secs();
     let pos_int = pos_float.as_ivec2();
     let field_size = FIELD_SIZE.as_ivec2();
     let q = pos_int.div_euclid(field_size) * field_size;
@@ -425,26 +443,64 @@ fn update(
         },
         VIEW_SIZE,
     ));
-}
-
-fn spawn_enemies(
-    mut commands: Commands,
-    mut random_source: ResMut<RandomSource>,
-    enemy_sources: Query<&mut EnemySource>,
-    time: Res<Time>,
-) {
+    let enemies_bvh = enemies_bvh.into_inner();
+    enemies_bvh.bvh.refit(&mut enemies_bvh.workspace);
+    enemies_bvh.optimization_counter += 1;
+    if enemies_bvh.optimization_counter > 10 {
+        enemies_bvh
+            .bvh
+            .optimize_incremental(&mut enemies_bvh.workspace);
+        enemies_bvh.optimization_counter = 0;
+    }
     for mut enemy_source in enemy_sources {
         let time = enemy_source.time + time.delta();
         let num_enemies = (time.as_nanos() / enemy_source.pace.as_nanos()) as u32;
         enemy_source.time = time - num_enemies * enemy_source.pace;
-        let pos = 40.0 * Vec2::from_angle(random_source.0.random_range(0.0..360.0));
+        let size = enemy_source.radius;
         for _ in 0..num_enemies {
-            commands.spawn((
-                Enemy,
+            let pos = 40.0 * Vec2::from_angle(random_source.0.random_range(0.0..360.0));
+            let entity = commands.spawn((
+                Enemy { radius: size },
                 Mesh2d(enemy_source.stroke.clone()),
                 MeshMaterial2d(enemy_source.stroke_color.clone()),
                 Transform::from_translation(pos.extend(0.0)),
             ));
+            enemies_bvh.bvh.insert(
+                Aabb::new(pos - Vec2::splat(size), pos + Vec2::splat(size)),
+                entity.id().index_u32(),
+            );
         }
+    }
+    for (entity, enemy, mut transform) in &mut enemies {
+        let radius = enemy.radius;
+        let old_pos = transform.translation.truncate();
+        let old_aabb = Aabb::new(old_pos - Vec2::splat(radius), old_pos + Vec2::splat(radius));
+        let mut enemy_velocity = -10.0 * old_pos.normalize_or_zero();
+        {
+            let player_distance_squared = old_pos.length_squared();
+            enemy_velocity *= player_distance_squared - radius * radius;
+            enemy_velocity /= player_distance_squared;
+        }
+        for other_index in enemies_bvh.bvh.intersect_aabb(&old_aabb) {
+            if other_index == entity.index_u32() {
+                continue;
+            }
+            let other_node = enemies_bvh.bvh.leaf_node(other_index).unwrap();
+            let other_radius = (other_node.maxs().x - other_node.mins().x) / 2.0;
+            let sum_radii = radius + other_radius;
+            let diff = old_pos - other_node.center();
+            let enemy_distance_squared = diff.length_squared();
+            if enemy_distance_squared < sum_radii * sum_radii {
+                enemy_velocity += diff / enemy_distance_squared;
+            }
+        }
+        let new_pos = old_pos + (enemy_velocity - player_velocity) * time.delta_secs();
+        transform.translation = new_pos.extend(0.0);
+    }
+    for (entity, enemy, transform) in &enemies {
+        let size = enemy.radius;
+        let new_pos = transform.translation.truncate();
+        let new_aabb = Aabb::new(new_pos - Vec2::splat(size), new_pos + Vec2::splat(size));
+        enemies_bvh.bvh.insert(new_aabb, entity.index_u32());
     }
 }
