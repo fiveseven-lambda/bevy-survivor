@@ -1,8 +1,10 @@
+use bevy::ecs::entity::{Entities, EntityIndex};
 use bevy::image::{ImageAddressMode, ImageSampler, ImageSamplerDescriptor};
 use bevy::prelude::*;
 use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
 use parry2d::bounding_volume::Aabb;
 use parry2d::partitioning::{Bvh, BvhWorkspace};
+use parry2d::query::PointQuery;
 use rand::RngExt;
 use std::sync::{Arc, Mutex};
 
@@ -72,6 +74,7 @@ struct RandomSource(rand::rngs::StdRng);
 #[derive(Component)]
 struct EnemySource {
     radius: f32,
+    health: u32,
     stroke: Handle<Mesh>,
     stroke_color: Handle<ColorMaterial>,
     pace: std::time::Duration,
@@ -81,6 +84,7 @@ struct EnemySource {
 #[derive(Component)]
 struct Enemy {
     radius: f32,
+    health: u32,
 }
 
 #[derive(Resource)]
@@ -89,6 +93,17 @@ struct EnemiesBvh {
     workspace: BvhWorkspace,
     optimization_counter: u32,
 }
+
+#[derive(Component)]
+struct Gun {
+    interval: std::time::Duration,
+    time: std::time::Duration,
+    bullet: Handle<Mesh>,
+    bullet_color: Handle<ColorMaterial>,
+}
+
+#[derive(Component)]
+struct Bullet;
 
 fn main() {
     App::new()
@@ -348,17 +363,19 @@ fn setup_title_screen(
     ));
     commands.spawn(EnemySource {
         radius: 0.6,
+        health: 20,
         stroke: meshes.add(Circle::new(0.6).to_ring(0.1)),
         stroke_color: materials.add(Color::BLACK),
-        pace: std::time::Duration::from_secs(1),
+        pace: std::time::Duration::from_millis(2000),
         time: std::time::Duration::ZERO,
     });
 
     commands.spawn(EnemySource {
         radius: 0.4,
+        health: 10,
         stroke: meshes.add(Circle::new(0.4).to_ring(0.1)),
         stroke_color: materials.add(Color::BLACK),
-        pace: std::time::Duration::from_millis(200),
+        pace: std::time::Duration::from_millis(500),
         time: std::time::Duration::ZERO,
     });
 
@@ -366,6 +383,13 @@ fn setup_title_screen(
         bvh: Bvh::new(),
         workspace: BvhWorkspace::default(),
         optimization_counter: 0,
+    });
+
+    commands.spawn(Gun {
+        interval: std::time::Duration::from_millis(400),
+        time: std::time::Duration::ZERO,
+        bullet: meshes.add(Circle::new(0.2)),
+        bullet_color: materials.add(Color::BLACK),
     });
 }
 
@@ -414,13 +438,16 @@ fn calculate_direction(
 
 fn update(
     mut commands: Commands,
+    entities: &Entities,
     mut player: ResMut<Player>,
     mut player_fill: Single<&mut MeshMaterial2d<ColorMaterial>, With<PlayerFill>>,
     mut background: Single<&mut Sprite>,
-    mut enemies: Query<(Entity, &Enemy, &mut Transform)>,
+    mut enemies: Query<(Entity, &Enemy, &mut Transform), Without<Bullet>>,
     enemies_bvh: ResMut<EnemiesBvh>,
     enemy_sources: Query<&mut EnemySource>,
     mut random_source: ResMut<RandomSource>,
+    guns: Query<&mut Gun, Without<Bullet>>,
+    bullets: Query<(Entity, &mut Transform), With<Bullet>>,
     player_direction: Res<PlayerDirection>,
     resource_colors: Res<ResourceColors>,
     field: Res<Field>,
@@ -452,21 +479,52 @@ fn update(
             .optimize_incremental(&mut enemies_bvh.workspace);
         enemies_bvh.optimization_counter = 0;
     }
+    for (bullet_entity, mut bullet_transform) in bullets {
+        let bullet_pos = bullet_transform.translation.truncate();
+        if let Some((enemy_index, (_, enemy_pos))) = enemies_bvh.bvh.find_best(
+            f32::MAX,
+            |node, _| node.aabb().distance_to_local_point(bullet_pos, true),
+            |index, _| {
+                let aabb = enemies_bvh.bvh.leaf_node(index).unwrap().aabb();
+                let center = aabb.center();
+                let radius = aabb.half_extents().x;
+                Some((center.distance(bullet_pos) - radius, center))
+            },
+        ) {
+            let relative_pos = enemy_pos - bullet_pos;
+            if relative_pos.length() < 1.0 {
+                let enemy_entity_index = EntityIndex::from_raw_u32(enemy_index).unwrap();
+                let enemy_entity = entities.resolve_from_index(enemy_entity_index);
+                commands.queue(move |world: &mut World| {
+                    if let Ok(mut enemy_entity_mut) = world.get_entity_mut(enemy_entity) {
+                        let mut enemy = enemy_entity_mut.get_mut::<Enemy>().unwrap();
+                        enemy.health = enemy.health.saturating_sub(10);
+                    }
+                    world.despawn(bullet_entity);
+                });
+            } else {
+                let bullet_velocity = 10.0 * relative_pos.normalize_or_zero();
+                bullet_transform.translation +=
+                    (time.delta_secs() * (bullet_velocity - player_velocity)).extend(0.0);
+            }
+        }
+    }
     for mut enemy_source in enemy_sources {
         let time = enemy_source.time + time.delta();
         let num_enemies = (time.as_nanos() / enemy_source.pace.as_nanos()) as u32;
         enemy_source.time = time - num_enemies * enemy_source.pace;
-        let size = enemy_source.radius;
+        let radius = enemy_source.radius;
+        let health = enemy_source.health;
         for _ in 0..num_enemies {
             let pos = 40.0 * Vec2::from_angle(random_source.0.random_range(0.0..360.0));
             let entity = commands.spawn((
-                Enemy { radius: size },
+                Enemy { radius, health },
                 Mesh2d(enemy_source.stroke.clone()),
                 MeshMaterial2d(enemy_source.stroke_color.clone()),
                 Transform::from_translation(pos.extend(0.0)),
             ));
             enemies_bvh.bvh.insert(
-                Aabb::new(pos - Vec2::splat(size), pos + Vec2::splat(size)),
+                Aabb::new(pos - Vec2::splat(radius), pos + Vec2::splat(radius)),
                 entity.id().index_u32(),
             );
         }
@@ -498,9 +556,26 @@ fn update(
         transform.translation = new_pos.extend(0.0);
     }
     for (entity, enemy, transform) in &enemies {
-        let size = enemy.radius;
-        let new_pos = transform.translation.truncate();
-        let new_aabb = Aabb::new(new_pos - Vec2::splat(size), new_pos + Vec2::splat(size));
-        enemies_bvh.bvh.insert(new_aabb, entity.index_u32());
+        if enemy.health == 0 {
+            commands.entity(entity).despawn();
+            enemies_bvh.bvh.remove(entity.index_u32());
+        } else {
+            let size = enemy.radius;
+            let new_pos = transform.translation.truncate();
+            let new_aabb = Aabb::new(new_pos - Vec2::splat(size), new_pos + Vec2::splat(size));
+            enemies_bvh.bvh.insert(new_aabb, entity.index_u32());
+        }
+    }
+    for mut gun in guns {
+        let mut time = gun.time + time.delta();
+        while time >= gun.interval {
+            commands.spawn((
+                Bullet,
+                Mesh2d(gun.bullet.clone()),
+                MeshMaterial2d(gun.bullet_color.clone()),
+            ));
+            time -= gun.interval;
+        }
+        gun.time = time;
     }
 }
