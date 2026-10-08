@@ -25,6 +25,7 @@ enum State {
     Loading,
     Paused,
     Running,
+    Result,
 }
 
 #[derive(Component)]
@@ -57,16 +58,17 @@ struct PlayerDirection(Vec2);
 struct Player {
     position: Vec2,
     resources: [f32; 3],
+    health: f32,
+    max_health: f32,
 }
 
 #[derive(Component)]
-struct PlayerStroke;
+struct PlayerTriangle(Triangle, f32);
 
-#[derive(Component)]
-struct PlayerFill;
-
-#[derive(Resource)]
-struct ResourceColors([Handle<ColorMaterial>; 3]);
+enum Triangle {
+    Inner,
+    Outer,
+}
 
 #[derive(Resource)]
 struct RandomSource(rand::rngs::StdRng);
@@ -124,6 +126,7 @@ fn main() {
             update_direction.run_if(in_state(State::Running).and_then(on_message::<CursorMoved>)),
         )
         .add_systems(Update, update.run_if(in_state(State::Running)))
+        .add_systems(OnEnter(State::Result), setup_result_screen)
         .insert_state(State::Loading)
         .run();
 }
@@ -321,27 +324,59 @@ fn setup_title_screen(
     let mut field_sprite = Sprite::from_image(images.add(field_image));
     field_sprite.rect = Some(Rect::from_center_size(Vec2::ZERO, VIEW_SIZE));
     commands.spawn((field_sprite, Transform::from_xyz(0.0, 0.0, -1.0)));
-    let player_fill = Circle::new(1.0);
-    let colors = RESOURCE_COLORS.map(|color| materials.add(color));
-    let player_fill_color = colors[field.0[0][0] as usize].clone();
-    commands.spawn((
-        PlayerFill,
-        Mesh2d(meshes.add(player_fill)),
-        MeshMaterial2d(player_fill_color),
-    ));
     commands.insert_resource(Player {
         position: Vec2::ZERO,
         resources: [0.0; 3],
+        health: 1.0,
+        max_health: 1.0,
     });
-    commands.insert_resource(ResourceColors(colors));
 
-    let player_stroke = Circle::new(1.0).to_ring(0.1);
-    let player_stroke_color = Color::WHITE;
-    commands.spawn((
-        PlayerStroke,
-        Mesh2d(meshes.add(player_stroke)),
-        MeshMaterial2d(materials.add(player_stroke_color)),
+    let player_radius = 1.0;
+    let player_resolution = 32;
+    let player_color = materials.add(Color::WHITE);
+    let theta = std::f32::consts::PI / player_resolution as f32;
+    let inner_radius = 0.0;
+    let (sin, cos) = f32::sin_cos(theta);
+    let inner_triangle = meshes.add(Triangle2d::new(
+        Vec2::new(0.0, 0.0),
+        Vec2::new(-player_radius, -player_radius * sin),
+        Vec2::new(-player_radius, player_radius * sin),
     ));
+    for i in 0..player_resolution {
+        let angle = (2 * i) as f32 * theta;
+        let rotation = Quat::from_rotation_z(angle);
+        let translation = player_radius * Vec2::from_angle(angle);
+        commands.spawn((
+            PlayerTriangle(Triangle::Inner, cos),
+            Mesh2d(inner_triangle.clone()),
+            MeshMaterial2d(player_color.clone()),
+            Transform {
+                scale: Vec3::new(1.0 - inner_radius * cos, inner_radius, 1.0),
+                rotation,
+                translation: translation.extend(0.0),
+            },
+        ));
+    }
+    let outer_triangle = meshes.add(Triangle2d::new(
+        Vec2::new(-player_radius, 0.0),
+        Vec2::new(0.0, -player_radius * sin),
+        Vec2::new(0.0, player_radius * sin),
+    ));
+    for i in 0..player_resolution {
+        let angle = (2 * i + 1) as f32 * theta;
+        let rotation = Quat::from_rotation_z(angle);
+        let translation = player_radius * cos * Vec2::from_angle(angle);
+        commands.spawn((
+            PlayerTriangle(Triangle::Outer, cos),
+            Mesh2d(outer_triangle.clone()),
+            MeshMaterial2d(player_color.clone()),
+            Transform {
+                scale: Vec3::new(cos - inner_radius, 1.0, 1.0),
+                rotation,
+                translation: translation.extend(0.0),
+            },
+        ));
+    }
 
     commands.spawn((
         Paused,
@@ -440,16 +475,19 @@ fn update(
     mut commands: Commands,
     entities: &Entities,
     mut player: ResMut<Player>,
-    mut player_fill: Single<&mut MeshMaterial2d<ColorMaterial>, With<PlayerFill>>,
     mut background: Single<&mut Sprite>,
-    mut enemies: Query<(Entity, &Enemy, &mut Transform), Without<Bullet>>,
+    mut enemies: Query<
+        (Entity, &Enemy, &mut Transform),
+        (Without<Bullet>, Without<PlayerTriangle>),
+    >,
     enemies_bvh: ResMut<EnemiesBvh>,
     enemy_sources: Query<&mut EnemySource>,
     mut random_source: ResMut<RandomSource>,
     guns: Query<&mut Gun, Without<Bullet>>,
+    player_triangles: Query<(&PlayerTriangle, &mut Transform), (Without<Gun>, Without<Bullet>)>,
     bullets: Query<(Entity, &mut Transform), With<Bullet>>,
     player_direction: Res<PlayerDirection>,
-    resource_colors: Res<ResourceColors>,
+    mut next_state: ResMut<NextState<State>>,
     field: Res<Field>,
     time: Res<Time>,
 ) {
@@ -462,7 +500,6 @@ fn update(
     let IVec2 { x: column, y: row } = pos_int - q;
     let cell = field.0[row as usize][column as usize] as usize;
     player.resources[cell] += time.delta_secs();
-    player_fill.0 = resource_colors.0[cell].clone();
     background.rect = Some(Rect::from_center_size(
         Vec2 {
             x: player.position.x,
@@ -503,7 +540,7 @@ fn update(
                     world.despawn(bullet_entity);
                 });
             } else {
-                let bullet_velocity = 10.0 * relative_pos.normalize_or_zero();
+                let bullet_velocity = 20.0 * relative_pos.normalize_or_zero();
                 bullet_transform.translation +=
                     (time.delta_secs() * (bullet_velocity - player_velocity)).extend(0.0);
             }
@@ -548,7 +585,7 @@ fn update(
             let sum_radii = radius + other_radius;
             let diff = old_pos - other_node.center();
             let enemy_distance_squared = diff.length_squared();
-            if enemy_distance_squared < sum_radii * sum_radii {
+            if enemy_distance_squared < 1000.0 * sum_radii * sum_radii {
                 enemy_velocity += diff / enemy_distance_squared;
             }
         }
@@ -562,8 +599,27 @@ fn update(
         } else {
             let size = enemy.radius;
             let new_pos = transform.translation.truncate();
+            if new_pos.length() < 1.0 {
+                player.health -= time.delta_secs();
+            }
             let new_aabb = Aabb::new(new_pos - Vec2::splat(size), new_pos + Vec2::splat(size));
             enemies_bvh.bvh.insert(new_aabb, entity.index_u32());
+        }
+    }
+    if player.health <= 0.0 {
+        next_state.set(State::Result);
+        return;
+    }
+    let inner_radius = 1.0 - player.health / player.max_health;
+    for (PlayerTriangle(triangle, cos), mut transform) in player_triangles {
+        match triangle {
+            Triangle::Inner => {
+                transform.scale.x = 1.0 - inner_radius * cos;
+                transform.scale.y = inner_radius;
+            }
+            Triangle::Outer => {
+                transform.scale.x = cos - inner_radius;
+            }
         }
     }
     for mut gun in guns {
@@ -578,4 +634,27 @@ fn update(
         }
         gun.time = time;
     }
+}
+
+fn setup_result_screen(
+    mut commands: Commands,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<ColorMaterial>>,
+) {
+    commands.spawn((
+        Mesh2d(meshes.add(Rectangle::from_size(VIEW_SIZE))),
+        MeshMaterial2d(materials.add(Color::hsva(0.0, 0.0, 0.0, 0.9))),
+    ));
+    commands.spawn((
+        Text2d::new(String::from("Game Over")),
+        TextFont {
+            font_size: FontSize::from(80.0),
+            ..default()
+        },
+        Transform::from_scale(Vec3 {
+            x: 0.1,
+            y: 0.1,
+            z: 1.0,
+        }),
+    ));
 }
